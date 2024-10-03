@@ -2,15 +2,19 @@
 # 
 # Venmo-OSINT Tool
 # Created by sc1341
-# Modified for authentication and verbose logging
+# Modified for authentication, verbose logging, and browser automation
 
 import argparse
 import random
-import requests
 import os
 import json
 import logging
 from getpass import getpass
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import TimeoutException
 
 from banner import banner
 from bs4 import BeautifulSoup
@@ -24,53 +28,63 @@ class VenmoOSINT:
     def __init__(self, username):
         self.username = username
         self.profile_data = {}
-        self.session = requests.Session()
-        self.session.headers.update({"User-Agent": random.choice(user_agents)})
+        self.driver = webdriver.Chrome()  # You'll need to have ChromeDriver installed and in your PATH
+        self.driver.implicitly_wait(10)
         logging.info(f"Initialized VenmoOSINT with username: {self.username}")
 
     def login(self, email, password):
-        """Log in to Venmo"""
+        """Log in to Venmo using Selenium"""
         logging.info("Attempting to log in to Venmo")
         login_url = "https://account.venmo.com/login"
         
-        # First, get the login page to retrieve any necessary tokens
-        response = self.session.get(login_url)
-        soup = BeautifulSoup(response.text, 'html.parser')
+        self.driver.get(login_url)
         
-        # Extract CSRF token (adjust the selector as needed)
-        csrf_token = soup.find('input', {'name': '_csrf'})['value']
-        
-        # Prepare login data
-        login_data = {
-            'username': email,
-            'password': password,
-            '_csrf': csrf_token
-        }
-        
-        # Attempt login
-        response = self.session.post(login_url, data=login_data)
-        
-        if "Welcome to Venmo" in response.text:
-            logging.info("Successfully logged in to Venmo")
-            return True
-        else:
-            logging.error("Failed to log in to Venmo")
+        try:
+            # Wait for email field and enter email
+            email_field = WebDriverWait(self.driver, 10).until(
+                EC.presence_of_element_located((By.ID, "email"))
+            )
+            email_field.send_keys(email)
+
+            # Enter password
+            password_field = self.driver.find_element(By.ID, "password")
+            password_field.send_keys(password)
+
+            # Click login button
+            login_button = self.driver.find_element(By.XPATH, "//button[contains(text(), 'Sign In')]")
+            login_button.click()
+
+            # Wait for successful login or 2FA prompt
+            try:
+                WebDriverWait(self.driver, 10).until(
+                    EC.presence_of_element_located((By.XPATH, "//h1[contains(text(), 'Welcome to Venmo')]"))
+                )
+                logging.info("Successfully logged in to Venmo")
+                return True
+            except TimeoutException:
+                logging.warning("2FA or additional verification may be required. Please check the browser window.")
+                input("Press Enter after completing 2FA or additional verification...")
+                return True
+
+        except Exception as e:
+            logging.error(f"An error occurred during login: {str(e)}")
             return False
 
     def scan_profile(self):
         """Scans the target profile and returns the data"""
         logging.info(f"Starting scan for profile: {self.username}")
-        try:
-            url = f"https://venmo.com/{self.username}"
-            logging.debug(f"Sending GET request to {url}")
-            r = self.session.get(url)
-            logging.debug(f"Received response with status code: {r.status_code}")
-        except requests.exceptions.ConnectionError:
-            logging.error("Connection error occurred. Check your network connection.")
-            return 1
+        url = f"https://venmo.com/{self.username}"
+        self.driver.get(url)
 
-        logging.info("Parsing response with BeautifulSoup")
-        soup = BeautifulSoup(r.text, "html.parser")
+        # Wait for transactions to load
+        try:
+            WebDriverWait(self.driver, 10).until(
+                EC.presence_of_element_located((By.CLASS_NAME, "single-payment"))
+            )
+        except TimeoutException:
+            logging.warning("No transactions found or page took too long to load.")
+
+        soup = BeautifulSoup(self.driver.page_source, "html.parser")
         transactions = soup.find_all("div", attrs={"class":"single-payment content-wrap"})
         logging.info(f"Found {len(transactions)} public transactions")
 
@@ -85,7 +99,6 @@ class VenmoOSINT:
             date = transaction.find_all("div", attrs={"class":"date"})[0].getText()
             export_message = f"{send} paid {recv}{date} for {message}"
             logging.info(export_message)
-            # assign values in dictionary for output
             self.profile_data[str(i)] = {"sender": send,
                                          "recipient": recv,
                                          "date": date,
@@ -108,6 +121,10 @@ class VenmoOSINT:
                 logging.debug(f"File {file_path} already exists, trying next index")
                 i += 1
 
+    def cleanup(self):
+        """Close the browser"""
+        self.driver.quit()
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Venmo-OSINT Tool, created by sc1341")
     parser.add_argument("--username", help="Username to scan", required=True)
@@ -122,16 +139,18 @@ def main():
     print(banner)
     logging.info("Starting Venmo-OSINT Tool")
     
-    # Get password securely
     password = getpass("Enter your Venmo password: ")
     
-    a = VenmoOSINT(args.username)
-    if a.login(args.email, password):
-        a.scan_profile()
-        a.save_data(args.filename)
-        logging.info("Venmo-OSINT Tool execution completed")
-    else:
-        logging.error("Login failed. Unable to proceed with scanning.")
+    venmo = VenmoOSINT(args.username)
+    try:
+        if venmo.login(args.email, password):
+            venmo.scan_profile()
+            venmo.save_data(args.filename)
+            logging.info("Venmo-OSINT Tool execution completed")
+        else:
+            logging.error("Login failed. Unable to proceed with scanning.")
+    finally:
+        venmo.cleanup()
 
 if __name__ == "__main__":
     main()
